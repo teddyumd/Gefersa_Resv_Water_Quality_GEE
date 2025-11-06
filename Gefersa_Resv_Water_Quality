@@ -6,6 +6,13 @@
 var USE_EMOJIS = true; // set false to remove emojis from labels
 function L(s){ return USE_EMOJIS ? s : s.replace(/^[^A-Za-z0-9]+ /,''); }
 
+// Panel & chart sizing (keep charts bounded to legend width)
+var PANEL_W   = 240;   // legend + charts panel width (px)
+var CHART_W   = 220;   // chart drawing width (px)  (PANEL_W minus padding)
+var CHART_H   = 180;   // default chart height (px)
+var CHART_H_T = 220;   // taller chart height for time series
+
+
 // ---------------- STUDY AREA ----------------
 var gefersaReservoir = ee.Geometry.Polygon([[
   [38.61673271020777, 9.054075867075518],
@@ -205,24 +212,32 @@ appPanel.add(exportButton);
 appPanel.add(statusLabel);
 ui.root.insert(0, appPanel);
 
-// Right-side chart panel (in-app charts)
+// Right-side chart panel (in-app charts) – same width as legend
 var chartPanel = ui.Panel({
   style: {
     position: 'top-right',
-    width: '430px',
-    height: '520px',
+    width: PANEL_W + 'px',     // ✅ match legend width
+    height: '520px',           // fixed height; no overflow style in EE
     padding: '10px',
     backgroundColor: 'white',
     border: '2px solid #9CCC65'
   },
   layout: ui.Panel.Layout.flow('vertical')
 });
-var chartHeader = ui.Label({value: L('📈 Charts'), style:{fontWeight:'bold', margin:'0 0 6px 0'}});
-// Description label that will change per chart
+
+var chartHeader = ui.Label({value: L('📈 Charts'),
+  style:{fontWeight:'bold', margin:'0 0 6px 0'}
+});
+
+// Wrap description so panel never expands
 var chartDescLabel = ui.Label({
   value: '',
-  style: {fontSize:'11px', color:'#444', margin:'0 0 8px 0'}
+  style: {
+    fontSize:'11px', color:'#444', margin:'0 0 8px 0', textAlign:'left',
+    whiteSpace:'normal', stretch:'horizontal', maxWidth: (PANEL_W - 20) + 'px'
+  }
 });
+
 chartPanel.add(chartHeader);
 chartPanel.add(chartDescLabel);
 ui.root.insert(1, chartPanel);
@@ -289,7 +304,7 @@ var legendPanel = ui.Panel({
     padding:'8px',
     backgroundColor:'white',
     border:'2px solid #43A047',
-    width:'240px'         // ✅ fixed width keeps text wrapping cleanly
+    width: PANEL_W + 'px'          // ✅ fixed width keeps text wrapping cleanly
   }
 });
 
@@ -554,10 +569,17 @@ function chartTimeSeries(){
     });
   }).filter(ee.Filter.notNull(['WQI']));
 
-  var chart = ui.Chart.feature.byFeature(feats, 'date', ['WQI'])
-    .setChartType('LineChart')
-    .setOptions({title:'WQI Time Series (per acquisition)', hAxis:{title:'Date', slantedText:true}, vAxis:{title:'WQI (0=best, 1=worst)'}, lineWidth:2});
-  chartPanel.add(chart);
+    var chart = ui.Chart.feature.byFeature(feats, 'date', ['WQI'])
+      .setChartType('LineChart')
+      .setOptions({
+        title:'WQI Time Series (per acquisition)',
+        hAxis:{title:'Date', slantedText:true},
+        vAxis:{title:'WQI (0=best, 1=worst)'},
+        lineWidth:2,
+        width: CHART_W,           // ✅ bound width
+        height: CHART_H_T         // ✅ taller
+      });
+    chartPanel.add(chart);
 }
 
 function chartParameterComparison(){
@@ -572,7 +594,13 @@ function chartParameterComparison(){
   var arr = ee.Array(labels.map(function(l){ return means.get(l); }));
   var chart = ui.Chart.array.values({array: arr, axis:0, xLabels: labels})
     .setChartType('ColumnChart')
-    .setOptions({title:'Current Water Quality Parameters (mean, masked to water)', hAxis:{title:'Parameter'}, vAxis:{title:'Normalized (0–1)'}});
+    .setOptions({
+      title:'Current Water Quality Parameters (mean, masked to water)',
+      hAxis:{title:'Parameter'},
+      vAxis:{title:'Normalized (0–1)'},
+      width: CHART_W,           // ✅
+      height: CHART_H           // ✅
+    });
   chartPanel.add(chart);
 }
 
@@ -584,10 +612,9 @@ function chartHistograms(){
   var wqi = calcWQI(calcTSS(comp), calcTurbidity(comp), calcDOProxy(comp), chl);
 
   var h1 = ui.Chart.image.histogram({image:wqi, region:gefersaReservoir, scale:20, maxPixels:1e9})
-    .setOptions({title:'WQI Distribution'});
+    .setOptions({title:'WQI Distribution', width: CHART_W, height: CHART_H});
   var h2 = ui.Chart.image.histogram({image:chl, region:gefersaReservoir, scale:20, maxPixels:1e9})
-    .setOptions({title:'Chlorophyll-a Distribution'});
-
+    .setOptions({title:'Chlorophyll-a Distribution', width: CHART_W, height: CHART_H});
   chartPanel.add(h1);
   chartPanel.add(h2);
 }
@@ -637,8 +664,11 @@ function chartQualityDistribution(){
   var labels = ['Excellent','Good','Fair','Poor','Very Poor'];
   var chart = ui.Chart.array.values({array: ee.Array(perc), axis:0, xLabels: labels})
     .setChartType('PieChart')
-    .setOptions({title:'WQI Classes (% of masked pixels)'});
-
+    .setOptions({
+      title:'WQI Classes (% of masked pixels)',
+      width: CHART_W,           // ✅
+      height: CHART_H           // ✅
+    });
   chartPanel.add(chart);
 }
 
@@ -658,10 +688,15 @@ function chartSeasonalComparison(){
     var mean = wqi.reduceRegion({reducer:ee.Reducer.mean(), geometry:gefersaReservoir, scale:30, maxPixels:1e9});
     return ee.Feature(null, {'Season': s.name, 'WQI': mean.get('WQI')});
   }));
-  var chart = ui.Chart.feature.byFeature(feats, 'Season', ['WQI'])
-    .setChartType('ColumnChart')
-    .setOptions({title:'Seasonal Comparison – WQI', vAxis:{title:'WQI'}});
-  chartPanel.add(chart);
+    var chart = ui.Chart.feature.byFeature(feats, 'Season', ['WQI'])
+      .setChartType('ColumnChart')
+      .setOptions({
+        title:'Seasonal Comparison – WQI',
+        vAxis:{title:'WQI'},
+        width: CHART_W,           // ✅
+        height: CHART_H           // ✅
+      });
+    chartPanel.add(chart);
 }
 
 function displayChart(){
