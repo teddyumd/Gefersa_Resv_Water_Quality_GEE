@@ -1,13 +1,12 @@
-/**
- * WATER QUALITY MONITORING SYSTEM - GEFERSA RESERVOIR
- * Using Sentinel-2 Satellite Imagery
- * Focused on Gefersa Reservoir, Ethiopia
- */
+/****************************************************
+ * GEFERSA RESERVOIR WATER QUALITY APP — v2
+ * Adds: Date-range slider, per-layer legends, in-app charts
+ ****************************************************/
 
-// =============================================
-// STEP 1: DEFINE GEFERSA RESERVOIR STUDY AREA
-// =============================================
+var USE_EMOJIS = true; // set false to remove emojis from labels
+function L(s){ return USE_EMOJIS ? s : s.replace(/^[^A-Za-z0-9]+ /,''); }
 
+// ---------------- STUDY AREA ----------------
 var gefersaReservoir = ee.Geometry.Polygon([[
   [38.61673271020777, 9.054075867075518],
   [38.62196838220484, 9.052465399525158],
@@ -21,805 +20,692 @@ var gefersaReservoir = ee.Geometry.Polygon([[
   [38.61450111230738, 9.062297615284608],
   [38.61673271020777, 9.054075867075518]
 ]]);
-
-print('🌊 GEFERSA RESERVOIR WATER QUALITY MONITORING');
-print('📍 Location: Gefersa Reservoir, Ethiopia');
-print('📐 Reservoir Area:', gefersaReservoir.area().divide(1000000), 'square kilometers');
-
 Map.centerObject(gefersaReservoir, 13);
 
-// =============================================
-// STEP 2: LOAD AND FILTER SENTINEL-2 IMAGERY
-// =============================================
-
-// Define time period for analysis
-var startDate = '2023-01-01';
-var endDate = '2024-06-01';
-
-// Load Sentinel-2 Surface Reflectance data
-var sentinel2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-  .filterBounds(gefersaReservoir)
-  .filterDate(startDate, endDate)
-  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
-  .select(['B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B11', 'B12']);
-
-print('📊 Sentinel-2 Collection Info for Gefersa:');
-print('Number of available images:', sentinel2.size());
-
-// Use the most recent composite for main analysis
-var composite = sentinel2.filterDate('2024-01-01', '2024-06-01').median();
-if (composite.bandNames().size().getInfo() === 0) {
-  composite = sentinel2.median();
+// -------------- DATA / HELPERS --------------
+function maskS2sr(img){
+  var qa = img.select('QA60');
+  var cloud = 1 << 10, cirrus = 1 << 11;
+  var qaMask = qa.bitwiseAnd(cloud).eq(0).and(qa.bitwiseAnd(cirrus).eq(0));
+  var scl = img.select('SCL');
+  var sclMask = scl.neq(3).and(scl.neq(8)).and(scl.neq(9)).and(scl.neq(10)).and(scl.neq(11));
+  return img.updateMask(qaMask).updateMask(sclMask).copyProperties(img, img.propertyNames());
 }
-composite = composite.clip(gefersaReservoir);
 
-// =============================================
-// STEP 3: WATER MASKING AND QUALITY PARAMETERS
-// =============================================
+function loadS2(start, end){
+  return ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(gefersaReservoir)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+    .map(maskS2sr)
+    .select(['B2','B3','B4','B5','B6','B7','B8','B8A','B11','B12','SCL']);
+}
 
-function createReservoirWaterMask(image) {
-  var mndwi = image.normalizedDifference(['B3', 'B11']).rename('MNDWI');
+function createWaterMask(image){
+  var mndwi = image.normalizedDifference(['B3','B11']);
   var aweish = image.select('B2').multiply(2.5)
     .subtract(image.select('B3').multiply(1.5))
     .subtract(image.select('B8').multiply(0.25))
     .subtract(image.select('B11').multiply(0.75))
     .add(0.5);
-  var waterMask = mndwi.gt(0.0).and(aweish.gt(0));
-  return waterMask.selfMask();
+  return mndwi.gt(0.0).and(aweish.gt(0)).selfMask();
 }
 
-var waterMask = createReservoirWaterMask(composite);
-var waterComposite = composite.updateMask(waterMask);
-
-// Calculate water quality parameters
-function calculateTSS(image) {
-  var red = image.select('B4');
-  var green = image.select('B3');
-  var nir = image.select('B8');
-  var tss1 = red.divide(green).multiply(3.0);
-  var tss2 = nir.divide(red).multiply(2.0);
-  var tss = tss1.multiply(0.6).add(tss2.multiply(0.4)).subtract(0.8).rename('TSS');
-  return tss.unitScale(0, 8);
+function calcTSS(img){
+  var red = img.select('B4'), green = img.select('B3'), nir = img.select('B8');
+  var tss = red.divide(green).multiply(3.0).multiply(0.6)
+    .add(nir.divide(red).multiply(2.0).multiply(0.4))
+    .subtract(0.8);
+  return tss.unitScale(0,8).rename('TSS');
+}
+function calcTurbidity(img){
+  var blue = img.select('B2'), green = img.select('B3'), red = img.select('B4');
+  var turb = blue.add(green).multiply(0.00015).add(red.divide(green).multiply(2.0));
+  return turb.unitScale(0,12).rename('Turbidity');
+}
+function calcDOProxy(img){
+  var ndci = img.normalizedDifference(['B5','B4']);
+  var dop = ndci.multiply(-2.5).add(3.0);
+  return dop.unitScale(0,12).rename('DO_Proxy');
+}
+function calcChl(img){
+  var blue = img.select('B2'), green = img.select('B3'), re1 = img.select('B5'), red = img.select('B4');
+  var chl = blue.divide(green).multiply(120).add(re1.divide(red).multiply(80)).divide(2);
+  return chl.unitScale(0,60).rename('Chlorophyll');
+}
+function calcWQI(tss, turb, dop, chl){
+  return tss.multiply(0.25).add(turb.multiply(0.30)).add(dop.multiply(0.25)).add(chl.multiply(0.20)).rename('WQI');
 }
 
-function calculateTurbidity(image) {
-  var blue = image.select('B2');
-  var green = image.select('B3');
-  var red = image.select('B4');
-  var turb1 = blue.add(green).multiply(0.00015);
-  var turb2 = red.divide(green).multiply(2.0);
-  var turbidity = turb1.add(turb2).rename('Turbidity');
-  return turbidity.unitScale(0, 12);
+function palette(name){
+  var dict = {
+    TSS: ['#08306b','#08519c','#2171b5','#6baed6','#fd8d3c','#e31a1c'],
+    Turbidity: ['#081d58','#253494','#2c7fb8','#e0ecf4'],
+    DO_Proxy: ['#b10026','#fc4e2a','#fd8d3c','#78c679','#006837'],
+    Chlorophyll: ['#2166ac','#1a9850','#fee08b','#f46d43','#a50026'],
+    WQI: ['#00441b','#238b45','#fed976','#f16913','#99000d'],
+    Mask: ['#d9d9d9','#3182bd']
+  };
+  return dict[name];
 }
 
-function calculateDOProxy(image) {
-  var ndci = image.normalizedDifference(['B5', 'B4']).rename('NDCI');
-  var doProxy = ndci.multiply(-2.5).add(3.0).rename('DO_Proxy');
-  return doProxy.unitScale(0, 12);
+// ----------- PERIODS + DATE SLIDER -----------
+var PERIODS = {
+  '2023-2024 Full Period': ['2023-01-01','2024-12-31'],
+  '2023 Analysis': ['2023-01-01','2023-12-31'],
+  '2024 Analysis': ['2024-01-01','2024-12-31'],
+  'Dry Season (Jan-Apr)': ['2024-01-01','2024-04-30'],
+  'Wet Season (Jun-Sep)': ['2023-06-01','2023-09-30']
+};
+
+// If slider is used, it overrides the preset.
+function getDateRange(){
+  var range = dateSlider.getValue(); // {start: Date, end: Date}
+  // If user touched the slider, prefer it
+  if (range && range.start && range.end){
+    // Format YYYY-MM-DD without any server call
+    var s = new Date(range.start);
+    var e = new Date(range.end);
+    var sStr = s.toISOString().slice(0,10);
+    var eStr = e.toISOString().slice(0,10);
+    return [sStr, eStr];
+  }
+  // Fallback to preset
+  return PERIODS[periodSelector.getValue()];
 }
 
-function calculateChlorophyll(image) {
-  var blue = image.select('B2');
-  var green = image.select('B3');
-  var redEdge1 = image.select('B5');
-  var red = image.select('B4');
-  var chl1 = blue.divide(green).multiply(120);
-  var chl2 = redEdge1.divide(red).multiply(80);
-  var chlorophyll = chl1.add(chl2).divide(2).rename('Chlorophyll');
-  return chlorophyll.unitScale(0, 60);
+// ------------------ UI ------------------
+var appPanel = ui.Panel({
+  style:{position:'top-left', width:'360px', padding:'10px', backgroundColor:'white', border:'2px solid #1E88E5'}
+});
+var appTitle = ui.Label({
+  value: L('🌊 GEFERSA RESERVOIR WATER QUALITY MONITORING'),
+  style:{fontWeight:'bold', fontSize:'16px', margin:'0 0 10px 0', color:'#1E88E5', textAlign:'center'}
+});
+var appDescription = ui.Label({
+  value: 'Interactive water-quality monitoring using Sentinel-2. Choose a layer, pick a date range, and view charts.',
+  style:{fontSize:'12px', margin:'0 0 12px 0', textAlign:'center'}
+});
+
+var layerSelector = ui.Select({
+  items:[
+    L('📍 Reservoir Boundary'),
+    L('🛰️ True Color Satellite'),
+    L('💧 Water Areas Only'),
+    L('🎯 Water Mask'),
+    L('💧 TSS - Total Suspended Solids'),
+    L('🌊 Turbidity - Water Clarity'),
+    L('💨 DO Proxy - Dissolved Oxygen'),
+    L('🌿 Chlorophyll-a - Algal Concentration'),
+    L('📊 Water Quality Index - Overall'),
+    L('🥧 WQI Classes - Categories')
+  ],
+  value: L('📍 Reservoir Boundary'),
+  style:{width:'100%', margin:'8px 0'}
+});
+
+var chartSelector = ui.Select({
+  items:[
+    L('📈 Time Series Analysis'),
+    L('📊 Parameter Comparison'),
+    L('🌦️ Seasonal Comparison'),
+    L('📈 Distribution Histograms'),
+    L('🥧 Quality Class Distribution')
+  ],
+  value: L('📈 Time Series Analysis'),
+  style:{width:'100%', margin:'8px 0'}
+});
+
+var periodSelector = ui.Select({
+  items:Object.keys(PERIODS),
+  value:'2023-2024 Full Period',
+  style:{width:'100%', margin:'8px 0'}
+});
+
+// Use plain JS Date objects for the slider
+var START_MIN = new Date('2023-01-01T00:00:00Z');
+var END_MAX   = new Date('2024-12-31T23:59:59Z');
+
+var dateSlider = ui.DateSlider({
+  start: START_MIN,
+  end: END_MAX,
+  value: [START_MIN, END_MAX],
+  period: 1,               // days
+  style: {width: '100%'}
+});
+
+var refreshButton = ui.Button({
+  label: L('🔄 Refresh Analysis'),
+  style:{width:'100%', margin:'6px 0', backgroundColor:'#4CAF50', color:'white'}
+});
+
+var exportButton = ui.Button({
+  label: L('📤 Export Data'),
+  style:{width:'100%', margin:'6px 0', backgroundColor:'#2196F3', color:'white'}
+});
+
+var statusLabel = ui.Label({
+  value: L('✅ Ready – Select layers and charts'),
+  style:{fontSize:'11px', margin:'6px 0', color:'#666', textAlign:'center'}
+});
+
+// Build left panel
+appPanel.add(appTitle);
+appPanel.add(appDescription);
+appPanel.add(ui.Label(L('📅 DATE RANGE (overrides preset):')));
+appPanel.add(dateSlider);
+appPanel.add(ui.Label(L('🗓️ PRESET PERIOD (optional):')));
+appPanel.add(periodSelector);
+appPanel.add(ui.Label(L('🎯 SELECT LAYER:')));
+appPanel.add(layerSelector);
+appPanel.add(ui.Label(L('📊 SELECT CHART:')));
+appPanel.add(chartSelector);
+appPanel.add(refreshButton);
+appPanel.add(exportButton);
+appPanel.add(statusLabel);
+ui.root.insert(0, appPanel);
+
+// Right-side chart panel (in-app charts)
+var chartPanel = ui.Panel({
+  style: {
+    position: 'top-right',
+    width: '430px',
+    height: '520px',
+    padding: '10px',
+    backgroundColor: 'white',
+    border: '2px solid #9CCC65'
+  },
+  layout: ui.Panel.Layout.flow('vertical')
+});
+var chartHeader = ui.Label({value: L('📈 Charts'), style:{fontWeight:'bold', margin:'0 0 6px 0'}});
+// Description label that will change per chart
+var chartDescLabel = ui.Label({
+  value: '',
+  style: {fontSize:'11px', color:'#444', margin:'0 0 8px 0'}
+});
+chartPanel.add(chartHeader);
+chartPanel.add(chartDescLabel);
+ui.root.insert(1, chartPanel);
+
+function getDateRangeLabel(){
+  var dr = getDateRange(); // returns ['YYYY-MM-DD','YYYY-MM-DD']
+  return dr[0] + ' to ' + dr[1];
 }
 
-var tss = calculateTSS(waterComposite);
-var turbidity = calculateTurbidity(waterComposite);
-var doProxy = calculateDOProxy(waterComposite);
-var chlorophyll = calculateChlorophyll(waterComposite);
+function setChartDescription(kind){
+  var rangeTxt = getDateRangeLabel();
+  var text = '';
 
-function calculateReservoirWQI(tss, turbidity, doProxy, chlorophyll) {
-  var wqi = tss.multiply(0.25)
-              .add(turbidity.multiply(0.30))
-              .add(doProxy.multiply(0.25))
-              .add(chlorophyll.multiply(0.20))
-              .rename('WQI');
-  return wqi;
+  if (kind === 'time'){
+    text = 'Shows the Water Quality Index (WQI) for each valid Sentinel-2 acquisition from ' +
+           rangeTxt + '. Lower values indicate better water quality. Use this to spot trends, spikes after rains, or gradual changes.';
+  }
+  else if (kind === 'compare'){
+    text = 'Compares the mean of key indicators (TSS, Turbidity, DO Proxy, Chlorophyll, WQI) within the reservoir for ' +
+           rangeTxt + '. Values are normalized (0–1) and masked to water only. Use this to see which parameter is driving WQI.';
+  }
+  else if (kind === 'hists'){
+    text = 'Shows how pixel values are distributed within the reservoir for ' + rangeTxt +
+           '. The WQI histogram highlights overall water quality spread, while Chlorophyll-a shows algal concentration variability.';
+  }
+  else if (kind === 'classes'){
+    text = 'Breaks WQI into five classes (Excellent → Very Poor) and shows the percentage of water pixels in each class for ' +
+           rangeTxt + '. This is useful for quick condition summaries and change communication.';
+  }
+  else if (kind === 'season'){
+    text = 'Compares mean WQI across seasonal windows to illustrate hydrological effects (e.g., dilution vs. runoff). ' +
+           'Use this to contrast Dry Season (Jan–Apr) and Wet Season (Jun–Sep).';
+  }
+
+  chartDescLabel.setValue(text);
 }
 
-var waterQualityIndex = calculateReservoirWQI(tss, turbidity, doProxy, chlorophyll);
+// Make sure clearCharts keeps header + description
+function clearCharts(){
+  chartPanel.clear();
+  chartPanel.add(chartHeader);
+  chartPanel.add(chartDescLabel);
+}
 
-var wqiClasses = waterQualityIndex
-  .where(waterQualityIndex.lt(0.2), 1)
-  .where(waterQualityIndex.gte(0.2).and(waterQualityIndex.lt(0.4)), 2)
-  .where(waterQualityIndex.gte(0.4).and(waterQualityIndex.lt(0.6)), 3)
-  .where(waterQualityIndex.gte(0.6).and(waterQualityIndex.lt(0.8)), 4)
-  .where(waterQualityIndex.gte(0.8), 5)
-  .rename('WQI_Class');
 
-// =============================================
-// STEP 4: ADD LAYERS (RESERVOIR BOUNDARY ONLY BY DEFAULT)
-// =============================================
+function clearCharts(){
+  chartPanel.clear();
+  chartPanel.add(ui.Label({value: L('Charts'), style:{fontWeight:'bold', margin:'0 0 6px 0'}}));
+}
 
-// Add Reservoir Boundary as the only default visible layer
-Map.addLayer(gefersaReservoir, 
-  {color: 'red', fillColor: '00000000'}, 
-  'Reservoir Boundary'
-);
+// Example: add multiple charts but keep each collapsible
+function addChartWithHeader(title, chart){
+  var header = ui.Label(title, {fontWeight:'bold', margin:'6px 0 4px 0'});
+  var box = ui.Panel({style:{border:'1px solid #eee', padding:'6px', margin:'0 0 8px 0'}});
+  box.add(header);
+  box.add(chart);
+  chartPanel.add(box);
+}
 
-// Add all other layers but keep them hidden by default
-Map.addLayer(composite, 
-  {bands: ['B4', 'B3', 'B2'], min: 0, max: 2500}, 
-  'True Color - Base Satellite Image',
-  false
-);
-
-Map.addLayer(waterComposite, 
-  {bands: ['B3', 'B4', 'B2'], min: 0, max: 2000}, 
-  'Water Areas Only',
-  false
-);
-
-Map.addLayer(waterMask, 
-  {min: 0, max: 1, palette: ['lightgray', 'blue']}, 
-  'Water Mask',
-  false
-);
-
-Map.addLayer(tss, {
-  min: 0, max: 1, 
-  palette: ['darkblue', 'blue', 'cyan', 'yellow', 'orange', 'red']
-}, 'TSS - Total Suspended Solids', false);
-
-Map.addLayer(turbidity, {
-  min: 0, max: 1,
-  palette: ['darkblue', 'blue', 'lightblue', 'white']
-}, 'Turbidity - Water Clarity', false);
-
-Map.addLayer(doProxy, {
-  min: 0, max: 1,
-  palette: ['red', 'orange', 'yellow', 'lightgreen', 'darkgreen']
-}, 'DO Proxy - Dissolved Oxygen', false);
-
-Map.addLayer(chlorophyll, {
-  min: 0, max: 1,
-  palette: ['blue', 'green', 'yellow', 'red', 'darkred']
-}, 'Chlorophyll-a - Algal Concentration', false);
-
-Map.addLayer(waterQualityIndex, {
-  min: 0, max: 1,
-  palette: ['darkgreen', 'green', 'yellow', 'orange', 'red']
-}, 'Water Quality Index - Overall', false);
-
-Map.addLayer(wqiClasses, {
-  min: 1, max: 5,
-  palette: ['darkgreen', 'green', 'yellow', 'orange', 'red']
-}, 'WQI Classes - Categories', false);
-
-// =============================================
-// STEP 5: COMPREHENSIVE STATIC LEGEND SYSTEM
-// =============================================
-
-// Create main legend panel
+// Bottom-right legend panel (dynamic per layer)
 var legendPanel = ui.Panel({
-  style: {
-    position: 'bottom-right',
-    padding: '10px',
-    backgroundColor: 'white',
-    border: '2px solid #1E88E5'
+  style:{
+    position:'bottom-right',
+    padding:'8px',
+    backgroundColor:'white',
+    border:'2px solid #43A047',
+    width:'240px'         // ✅ fixed width keeps text wrapping cleanly
   }
 });
 
-// Legend Title
-var legendTitle = ui.Label({
-  value: '🌊 WATER QUALITY LEGEND',
-  style: {
-    fontWeight: 'bold', 
-    fontSize: '14px', 
-    margin: '0 0 10px 0', 
-    color: '#1E88E5',
-    textAlign: 'center'
+ui.root.insert(2, legendPanel);
+
+// ---------------- STATE ----------------
+var state = { collection:null, currentComposite:null, currentWaterComposite:null };
+
+function computeForRange(){
+  var dr = getDateRange();
+  var start = dr[0], end = dr[1];
+  state.collection = loadS2(start, end);
+  var composite = state.collection.median().clip(gefersaReservoir);
+
+  // Single-band water mask
+  var wm = createWaterMask(composite); // <-- one band
+
+  state.currentComposite = composite;
+  state.waterMask = wm;                           // <-- keep single-band mask
+  state.currentWaterComposite = composite.updateMask(wm); // masked multiband image
+}
+
+// Append-only gradient legend. NOTE: _title is ignored because the caller
+// (updateLegendForLayer) already added a title + description above.
+function buildGradientLegend(_title, colors, minLabel, maxLabel){
+  // gradient bar (series of small colored boxes)
+  var bar = ui.Panel({
+    layout: ui.Panel.Layout.Flow('horizontal'),
+    style: {margin: '2px 0 2px 0'}
+  });
+  var n = colors.length;
+  for (var i = 0; i < n; i++){
+    bar.add(ui.Label({
+      style: {
+        backgroundColor: colors[i],
+        padding: '0px',
+        margin: '0px',
+        width: (200 / n) + 'px',
+        height: '12px',
+        border: '1px solid #eee'
+      }
+    }));
   }
-});
-legendPanel.add(legendTitle);
+  legendPanel.add(bar);
 
-// Water Quality Index Legend Section
-var wqiSectionTitle = ui.Label({
-  value: '🎯 WATER QUALITY INDEX',
-  style: {fontWeight: 'bold', fontSize: '12px', margin: '8px 0 5px 0', color: '#333'}
-});
-legendPanel.add(wqiSectionTitle);
-
-var wqiLevels = [
-  {color: 'darkgreen', range: '0.0-0.2', label: 'Excellent - Drinking Quality'},
-  {color: 'green', range: '0.2-0.4', label: 'Good - Recreational'},
-  {color: 'yellow', range: '0.4-0.6', label: 'Fair - Treatment Needed'},
-  {color: 'orange', range: '0.6-0.8', label: 'Poor - Irrigation Only'},
-  {color: 'red', range: '0.8-1.0', label: 'Very Poor - Extensive Treatment'}
-];
-
-wqiLevels.forEach(function(level) {
-  var colorBox = ui.Label({
-    style: {
-      backgroundColor: level.color, 
-      padding: '8px', 
-      margin: '0 5px 0 0', 
-      border: '1px solid #333',
-      width: '20px',
-      height: '10px'
-    }
-  });
-  
-  var rangeLabel = ui.Label({
-    value: level.range,
-    style: {fontSize: '10px', width: '45px', margin: '0 5px 0 0'}
-  });
-  
-  var descLabel = ui.Label({
-    value: level.label,
-    style: {fontSize: '9px'}
-  });
-  
+  // min/max row
   var row = ui.Panel({
-    widgets: [colorBox, rangeLabel, descLabel],
-    layout: ui.Panel.Layout.Flow('horizontal')
+    widgets: [
+      ui.Label(minLabel, {fontSize:'10px', margin:'4px 8px 0 0'}),
+      ui.Label({value:'', style:{stretch:'horizontal'}}),
+      ui.Label(maxLabel, {fontSize:'10px', margin:'4px 0 0 8px'})
+    ],
+    layout: ui.Panel.Layout.Flow('horizontal'),
+    style: {width:'100%'}
   });
-  
   legendPanel.add(row);
-});
-
-// Parameter Legends Section
-var paramSectionTitle = ui.Label({
-  value: '📊 INDIVIDUAL PARAMETERS',
-  style: {fontWeight: 'bold', fontSize: '12px', margin: '15px 0 8px 0', color: '#333'}
-});
-legendPanel.add(paramSectionTitle);
-
-// TSS Legend
-var tssTitle = ui.Label({
-  value: '💧 TSS - Total Suspended Solids',
-  style: {fontWeight: 'bold', fontSize: '10px', margin: '5px 0 3px 0', color: '#555'}
-});
-legendPanel.add(tssTitle);
-
-var tssColors = [
-  {color: 'darkblue', value: '0-1 mg/L'},
-  {color: 'blue', value: '1-2 mg/L'},
-  {color: 'cyan', value: '2-3 mg/L'},
-  {color: 'yellow', value: '3-4 mg/L'},
-  {color: 'orange', value: '4-6 mg/L'},
-  {color: 'red', value: '6-8 mg/L'}
-];
-
-var tssRow = ui.Panel({
-  widgets: tssColors.map(function(item) {
-    return ui.Label({
-      style: {
-        backgroundColor: item.color, 
-        padding: '4px', 
-        margin: '0 2px', 
-        border: '1px solid #333',
-        width: '12px',
-        height: '8px'
-      }
-    });
-  }),
-  layout: ui.Panel.Layout.Flow('horizontal')
-});
-legendPanel.add(tssRow);
-
-var tssLabels = ui.Label({
-  value: 'Clear → Sediment Loaded',
-  style: {fontSize: '9px', margin: '2px 0 8px 0', fontStyle: 'italic'}
-});
-legendPanel.add(tssLabels);
-
-// Turbidity Legend
-var turbidityTitle = ui.Label({
-  value: '🌊 Turbidity - Water Clarity',
-  style: {fontWeight: 'bold', fontSize: '10px', margin: '5px 0 3px 0', color: '#555'}
-});
-legendPanel.add(turbidityTitle);
-
-var turbidityColors = [
-  {color: 'darkblue', value: '0-3 NTU'},
-  {color: 'blue', value: '3-6 NTU'},
-  {color: 'lightblue', value: '6-9 NTU'},
-  {color: 'white', value: '9-12 NTU'}
-];
-
-var turbidityRow = ui.Panel({
-  widgets: turbidityColors.map(function(item) {
-    return ui.Label({
-      style: {
-        backgroundColor: item.color, 
-        padding: '4px', 
-        margin: '0 2px', 
-        border: '1px solid #333',
-        width: '12px',
-        height: '8px'
-      }
-    });
-  }),
-  layout: ui.Panel.Layout.Flow('horizontal')
-});
-legendPanel.add(turbidityRow);
-
-var turbidityLabels = ui.Label({
-  value: 'Clear → Cloudy',
-  style: {fontSize: '9px', margin: '2px 0 8px 0', fontStyle: 'italic'}
-});
-legendPanel.add(turbidityLabels);
-
-// =============================================
-// TIME SERIES CHART - Quarterly Analysis (FIXED)
-// =============================================
-
-function createTimeSeriesChart() {
-  var quarters = ee.List([
-    {name: 'Q1-2023', start: '2023-01-01', end: '2023-03-31'},
-    {name: 'Q2-2023', start: '2023-04-01', end: '2023-06-30'},
-    {name: 'Q3-2023', start: '2023-07-01', end: '2023-09-30'},
-    {name: 'Q4-2023', start: '2023-10-01', end: '2023-12-31'},
-    {name: 'Q1-2024', start: '2024-01-01', end: '2024-03-31'},
-    {name: 'Q2-2024', start: '2024-04-01', end: '2024-06-30'}
-  ]);
-  
-  var features = ee.FeatureCollection(quarters.map(function(quarter) {
-    quarter = ee.Dictionary(quarter);
-    var quarterlyData = sentinel2.filterDate(quarter.get('start'), quarter.get('end'));
-    
-    // Check if we have images for this quarter
-    var composite = ee.Algorithms.If(
-      quarterlyData.size().gt(0),
-      quarterlyData.median().clip(gefersaReservoir),
-      null
-    );
-    
-    return ee.Feature(null, ee.Algorithms.If(
-      composite,
-      (function() {
-        var waterMask = createReservoirWaterMask(ee.Image(composite));
-        var waterImage = ee.Image(composite).updateMask(waterMask);
-        
-        var tss = calculateTSS(waterImage);
-        var turbidity = calculateTurbidity(waterImage);
-        var doProxy = calculateDOProxy(waterImage);
-        var chlorophyll = calculateChlorophyll(waterImage);
-        var wqi = calculateReservoirWQI(tss, turbidity, doProxy, chlorophyll);
-        
-        var means = ee.Image.cat([tss, turbidity, doProxy, chlorophyll, wqi])
-          .reduceRegion({
-            reducer: ee.Reducer.mean(),
-            geometry: gefersaReservoir,
-            scale: 10,
-            maxPixels: 1e9
-          });
-        
-        return ee.Dictionary({
-          'Period': quarter.get('name'),
-          'TSS': means.get('TSS'),
-          'Turbidity': means.get('Turbidity'),
-          'DO_Proxy': means.get('DO_Proxy'),
-          'Chlorophyll': means.get('Chlorophyll'),
-          'WQI': means.get('WQI')
-        });
-      })(),
-      null
-    ));
-  })).filter(ee.Filter.notNull(['Period']));
-  
-  // Create chart
-  var chart = ui.Chart.feature.byFeature({
-    features: features, 
-    xProperty: 'Period', 
-    yProperties: ['TSS', 'Turbidity', 'DO_Proxy', 'Chlorophyll', 'WQI']
-  })
-  .setChartType('LineChart')
-  .setOptions({
-    title: 'Gefersa Reservoir - Quarterly Water Quality Trends (2023-2024)',
-    hAxis: {title: 'Time Period'},
-    vAxis: {title: 'Parameter Value (Normalized 0-1)'},
-    lineWidth: 3,
-    series: {
-      0: {color: 'orange', lineWidth: 4},
-      1: {color: 'blue', lineWidth: 3},
-      2: {color: 'green', lineWidth: 3},
-      3: {color: 'red', lineWidth: 3},
-      4: {color: 'purple', lineWidth: 5}
-    }
-  });
-  
-  print('📈 QUARTERLY TIME SERIES CHART:');
-  print(chart);
 }
 
-createTimeSeriesChart();
-
-
-// =============================================
-// SPATIAL DISTRIBUTION HISTOGRAMS
-// =============================================
-
-function createSimpleHistograms() {
-  // WQI Histogram
-  var wqiHistogram = ui.Chart.image.histogram({
-    image: waterQualityIndex,
-    region: gefersaReservoir,
-    scale: 10,
-    maxPixels: 1e9
-  })
-  .setOptions({
-    title: 'Water Quality Index - Spatial Distribution',
-    hAxis: {title: 'WQI Value (0 = Best, 1 = Worst)'},
-    vAxis: {title: 'Pixel Count'},
-    colors: ['#FF6B6B']
+// Append-only categorical legend. NOTE: _title is ignored for same reason.
+function buildCategoricalLegend(_title, items){
+  items.forEach(function(it){
+    legendPanel.add(ui.Panel({
+      widgets: [
+        ui.Label({
+          style: {
+            backgroundColor: it.color,
+            padding: '6px',
+            margin: '0 6px 0 0',
+            border: '1px solid #333',
+            width: '22px'
+          }
+        }),
+        ui.Label({value: it.label, style: {fontSize:'10px'}})
+      ],
+      layout: ui.Panel.Layout.Flow('horizontal')
+    }));
   });
-  
-  // Chlorophyll Histogram
-  var chlorophyllHistogram = ui.Chart.image.histogram({
-    image: chlorophyll,
-    region: gefersaReservoir,
-    scale: 10,
-    maxPixels: 1e9
-  })
-  .setOptions({
-    title: 'Chlorophyll-a - Spatial Distribution',
-    hAxis: {title: 'Chlorophyll Value (Normalized)'},
-    vAxis: {title: 'Pixel Count'},
-    colors: ['#4ECDC4']
-  });
-  
-  print('📊 WQI DISTRIBUTION HISTOGRAM:');
-  print(wqiHistogram);
-  print('📊 CHLOROPHYLL DISTRIBUTION HISTOGRAM:');
-  print(chlorophyllHistogram);
 }
 
-createSimpleHistograms();
-// =============================================
-// SEASONAL COMPARISON CHART
-// =============================================
 
-function createSeasonalChart() {
-  var drySeason = sentinel2.filterDate('2024-01-01', '2024-04-30');
-  var wetSeason = sentinel2.filterDate('2023-06-01', '2023-09-30');
-  
-  var seasons = [
-    {name: 'Dry Season 2024', collection: drySeason},
-    {name: 'Wet Season 2023', collection: wetSeason}
-  ];
-  
-  var features = seasons.map(function(season) {
-    if (season.collection.size().getInfo() > 0) {
-      var composite = season.collection.median().clip(gefersaReservoir);
-      var waterMask = createReservoirWaterMask(composite);
-      var waterImage = composite.updateMask(waterMask);
-      
-      var tss = calculateTSS(waterImage);
-      var turbidity = calculateTurbidity(waterImage);
-      var doProxy = calculateDOProxy(waterImage);
-      var chlorophyll = calculateChlorophyll(waterImage);
-      var wqi = calculateReservoirWQI(tss, turbidity, doProxy, chlorophyll);
-      
-      var means = ee.Image.cat([tss, turbidity, doProxy, chlorophyll, wqi])
-        .reduceRegion({
-          reducer: ee.Reducer.mean(),
-          geometry: gefersaReservoir,
-          scale: 10,
-          maxPixels: 1e9
-        });
-      
-      return ee.Feature(null, {
-        'Season': season.name,
-        'TSS': means.get('TSS'),
-        'Turbidity': means.get('Turbidity'),
-        'DO_Proxy': means.get('DO_Proxy'),
-        'Chlorophyll': means.get('Chlorophyll'),
-        'WQI': means.get('WQI')
-      });
-    }
-    return null;
-  }).filter(function(feature) { return feature != null; });
-  
-  if (features.length > 0) {
-    var chart = ui.Chart.feature.byFeature(ee.FeatureCollection(features), 'Season', 
-      ['TSS', 'Turbidity', 'DO_Proxy', 'Chlorophyll', 'WQI'])
-      .setChartType('ColumnChart')
-      .setOptions({
-        title: 'Seasonal Comparison - Dry vs Wet Season',
-        hAxis: {title: 'Season'},
-        vAxis: {title: 'Parameter Value (Normalized 0-1)'},
-        isStacked: false,
-        series: {
-          0: {color: 'orange'},  // TSS
-          1: {color: 'blue'},    // Turbidity
-          2: {color: 'green'},   // DO Proxy
-          3: {color: 'red'},     // Chlorophyll
-          4: {color: 'purple'}   // WQI
-        }
-      });
-    
-    print('🌦️ SEASONAL COMPARISON CHART:');
-    print(chart);
+// --- IMPROVED LEGEND FUNCTION WITH DESCRIPTIONS ---
+function updateLegendForLayer(sel) {
+  legendPanel.clear();
+
+  // Helper to add a short text block under the legend title
+  function addDesc(text) {
+    legendPanel.add(ui.Label({
+      value: text,
+      style: {
+        fontSize: '10px',
+        color: '#444',
+        margin: '4px 0 6px 0',
+        textAlign: 'left',
+        whiteSpace: 'normal',     // ✅ enables wrapping
+        stretch: 'horizontal',    // keeps within panel width
+        maxWidth: '200px'         // optional: keeps neat width
+      }
+    }));
   }
+
+  if (sel === L('📍 Reservoir Boundary')) {
+    legendPanel.add(ui.Label({value:'Reservoir Boundary', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Polygon outline of the Gefersa Reservoir used as the analysis area.');
+    return;
+  }
+
+  if (sel === L('🛰️ True Color Satellite')) {
+    legendPanel.add(ui.Label({value:'True Color (RGB)', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Natural-color Sentinel-2 imagery (bands 4,3,2). Useful for visual context and cloud checking.');
+    return;
+  }
+
+  if (sel === L('💧 Water Areas Only')) {
+    legendPanel.add(ui.Label({value:'Water Areas (masked composite)', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Shows only pixels classified as water using the MNDWI–AWEI combined mask.');
+    return;
+  }
+
+  if (sel === L('🎯 Water Mask')) {
+    legendPanel.add(ui.Label({value:'Water Mask', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Binary mask derived from spectral indices (MNDWI & AWEI). Blue = water; gray = non-water.');
+    buildCategoricalLegend('Classes', [
+      {color: palette('Mask')[0], label:'Non-water / masked'},
+      {color: palette('Mask')[1], label:'Water'}
+    ]);
+    return;
+  }
+
+  if (sel === L('💧 TSS - Total Suspended Solids')) {
+    legendPanel.add(ui.Label({value:'TSS – Total Suspended Solids', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Represents the concentration of particulate matter in water. High TSS → muddy or sediment-laden water.');
+    buildGradientLegend('TSS (normalized)', palette('TSS'), 'Low', 'High');
+    return;
+  }
+
+  if (sel === L('🌊 Turbidity - Water Clarity')) {
+    legendPanel.add(ui.Label({value:'Turbidity – Water Clarity', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Measures how clear or cloudy the water is. Higher turbidity means lower transparency (less clarity).');
+    buildGradientLegend('Turbidity (normalized)', palette('Turbidity'), 'Clear', 'Turbid');
+    return;
+  }
+
+  if (sel === L('💨 DO Proxy - Dissolved Oxygen')) {
+    legendPanel.add(ui.Label({value:'DO Proxy – Dissolved Oxygen', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Proxy for oxygen levels based on spectral indices. Higher DO indicates healthier, better-aerated water.');
+    buildGradientLegend('DO Proxy (normalized)', palette('DO_Proxy'), 'Low', 'High');
+    return;
+  }
+
+  if (sel === L('🌿 Chlorophyll-a - Algal Concentration')) {
+    legendPanel.add(ui.Label({value:'Chlorophyll-a – Algal Concentration', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Estimates algae concentration from red-edge and blue/green ratios. High values suggest algal blooms or eutrophication.');
+    buildGradientLegend('Chlorophyll-a (normalized)', palette('Chlorophyll'), 'Low', 'High');
+    return;
+  }
+
+  if (sel === L('📊 Water Quality Index - Overall')) {
+    legendPanel.add(ui.Label({value:'WQI – Water Quality Index', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Composite index combining TSS, Turbidity, DO Proxy, and Chlorophyll. Lower values = better overall quality.');
+    buildGradientLegend('WQI (0 = Best, 1 = Worst)', palette('WQI'), 'Best', 'Worst');
+    return;
+  }
+
+  if (sel === L('🥧 WQI Classes - Categories')) {
+    legendPanel.add(ui.Label({value:'WQI Classes', style:{fontWeight:'bold', fontSize:'12px'}}));
+    addDesc('Categorizes the overall Water Quality Index into five classes from Excellent to Very Poor.');
+    buildCategoricalLegend('Classes', [
+      {color:'#00441b', label:'Excellent (0.0–0.2)'},
+      {color:'#238b45', label:'Good (0.2–0.4)'},
+      {color:'#fed976', label:'Fair (0.4–0.6)'},
+      {color:'#f16913', label:'Poor (0.6–0.8)'},
+      {color:'#99000d', label:'Very Poor (0.8–1.0)'}
+    ]);
+    return;
+  }
+
+  // Fallback
+  legendPanel.add(ui.Label({value:'No legend available', style:{fontSize:'10px', color:'#777'}}));
 }
 
-createSeasonalChart();
-// =============================================
-// QUALITY CLASS DISTRIBUTION PIE CHART
-// =============================================
 
-function createQualityPieChart() {
-  var classAreas = wqiClasses.reduceRegion({
-    reducer: ee.Reducer.frequencyHistogram(),
-    geometry: gefersaReservoir,
-    scale: 10,
-    maxPixels: 1e9
-  });
+// --------------- MAP LAYERS ---------------
+function updateMapLayer(){
+  Map.layers().reset();
+  statusLabel.setValue(L('🔄 Loading data...'));
 
-  classAreas.evaluate(function(result) {
-    if (result.risk_class) {
-      var classData = Object.keys(result.risk_class).map(function(classId) {
-        var area = result.risk_class[classId] * 100; // Convert to hectares
-        var className = getQualityClassName(parseInt(classId));
-        var color = getQualityClassColor(parseInt(classId));
-        return {class: className, area: area, color: color};
-      });
-      
-      var chartData = ee.FeatureCollection(classData.map(function(item, i) {
-        return ee.Feature(null, {
-          'Quality Class': item.class,
-          'Area (ha)': item.area,
-          'style': {color: item.color}
-        });
-      }));
-      
-      var pieChart = ui.Chart.feature.byProperty(chartData, 'Quality Class', 'Area (ha)')
-        .setChartType('PieChart')
-        .setOptions({
-          title: 'Water Quality Classes - Area Distribution',
-          slices: classData.reduce(function(slices, item, i) {
-            slices[i] = {color: item.color};
-            return slices;
-          }, {}),
-          pieSliceText: 'value',
-          sliceVisibilityThreshold: 0
-        });
-      
-      print('🥧 QUALITY CLASS DISTRIBUTION PIE CHART:');
-      print(pieChart);
-    }
-  });
-}
+  computeForRange();
+  var comp = state.currentComposite;
+  var wcomp = state.currentWaterComposite;
+  var sel = layerSelector.getValue();
 
-function getQualityClassName(classId) {
-  var names = {
-    1: 'Excellent',
-    2: 'Good', 
-    3: 'Fair',
-    4: 'Poor',
-    5: 'Very Poor'
-  };
-  return names[classId] || 'Unknown';
-}
-
-function getQualityClassColor(classId) {
-  var colors = {
-    1: 'darkgreen',
-    2: 'green',
-    3: 'yellow', 
-    4: 'orange',
-    5: 'red'
-  };
-  return colors[classId] || 'gray';
-}
-
-createQualityPieChart();
-// DO Proxy Legend
-var doTitle = ui.Label({
-  value: '💨 DO Proxy - Dissolved Oxygen',
-  style: {fontWeight: 'bold', fontSize: '10px', margin: '5px 0 3px 0', color: '#555'}
-});
-legendPanel.add(doTitle);
-
-var doColors = [
-  {color: 'red', value: '0-3 mg/L'},
-  {color: 'orange', value: '3-6 mg/L'},
-  {color: 'yellow', value: '6-8 mg/L'},
-  {color: 'lightgreen', value: '8-10 mg/L'},
-  {color: 'darkgreen', value: '10-12 mg/L'}
-];
-
-var doRow = ui.Panel({
-  widgets: doColors.map(function(item) {
-    return ui.Label({
-      style: {
-        backgroundColor: item.color, 
-        padding: '4px', 
-        margin: '0 2px', 
-        border: '1px solid #333',
-        width: '12px',
-        height: '8px'
-      }
-    });
-  }),
-  layout: ui.Panel.Layout.Flow('horizontal')
-});
-legendPanel.add(doRow);
-
-var doLabels = ui.Label({
-  value: 'Low Oxygen → High Oxygen',
-  style: {fontSize: '9px', margin: '2px 0 8px 0', fontStyle: 'italic'}
-});
-legendPanel.add(doLabels);
-
-// Chlorophyll Legend
-var chlorophyllTitle = ui.Label({
-  value: '🌿 Chlorophyll-a - Algae',
-  style: {fontWeight: 'bold', fontSize: '10px', margin: '5px 0 3px 0', color: '#555'}
-});
-legendPanel.add(chlorophyllTitle);
-
-var chlorophyllColors = [
-  {color: 'blue', value: '0-12 μg/L'},
-  {color: 'green', value: '12-24 μg/L'},
-  {color: 'yellow', value: '24-36 μg/L'},
-  {color: 'red', value: '36-48 μg/L'},
-  {color: 'darkred', value: '48-60 μg/L'}
-];
-
-var chlorophyllRow = ui.Panel({
-  widgets: chlorophyllColors.map(function(item) {
-    return ui.Label({
-      style: {
-        backgroundColor: item.color, 
-        padding: '4px', 
-        margin: '0 2px', 
-        border: '1px solid #333',
-        width: '12px',
-        height: '8px'
-      }
-    });
-  }),
-  layout: ui.Panel.Layout.Flow('horizontal')
-});
-legendPanel.add(chlorophyllRow);
-
-var chlorophyllLabels = ui.Label({
-  value: 'Low Algae → Algal Bloom',
-  style: {fontSize: '9px', margin: '2px 0 8px 0', fontStyle: 'italic'}
-});
-legendPanel.add(chlorophyllLabels);
-
-// Base Layers Legend
-var baseSectionTitle = ui.Label({
-  value: '🗺️ BASE LAYERS',
-  style: {fontWeight: 'bold', fontSize: '12px', margin: '15px 0 8px 0', color: '#333'}
-});
-legendPanel.add(baseSectionTitle);
-
-var baseLayers = [
-  {color: 'red', label: 'Reservoir Boundary - Study area outline'},
-  {color: 'blue', label: 'Water Mask - Blue: water, Gray: land'},
-  {style: 'natural', label: 'True Color - Natural satellite view'}
-];
-
-baseLayers.forEach(function(layer) {
-  var colorBox;
-  if (layer.color) {
-    colorBox = ui.Label({
-      style: {
-        backgroundColor: layer.color, 
-        padding: '6px', 
-        margin: '0 5px 0 0', 
-        border: '1px solid #333',
-        width: '15px',
-        height: '8px'
-      }
-    });
+  if (sel === L('📍 Reservoir Boundary')){
+    Map.addLayer(gefersaReservoir, {color:'red', fillColor:'00000000'}, 'Reservoir Boundary');
+  } else if (sel === L('🛰️ True Color Satellite')){
+    Map.addLayer(comp, {bands:['B4','B3','B2'], min:0, max:3000}, 'True Color');
+  } else if (sel === L('💧 Water Areas Only')){
+    Map.addLayer(wcomp, {bands:['B3','B4','B2'], min:0, max:2500}, 'Water Areas');
+  } else if (sel === L('🎯 Water Mask')){
+    var wm = wcomp.mask();
+    Map.addLayer(wm, {min:0,max:1, palette:palette('Mask')}, 'Water Mask');
   } else {
-    colorBox = ui.Label({
-      value: '🛰️',
-      style: {margin: '0 5px 0 0', fontSize: '12px'}
-    });
-  }
-  
-  var descLabel = ui.Label({
-    value: layer.label,
-    style: {fontSize: '9px', margin: '0 0 5px 0'}
-  });
-  
-  var row = ui.Panel({
-    widgets: [colorBox, descLabel],
-    layout: ui.Panel.Layout.Flow('horizontal')
-  });
-  
-  legendPanel.add(row);
-});
+    var tss = calcTSS(wcomp);
+    var turb = calcTurbidity(wcomp);
+    var dop  = calcDOProxy(wcomp);
+    var chl  = calcChl(wcomp);
+    var wqi  = calcWQI(tss, turb, dop, chl);
 
-Map.add(legendPanel);
-
-// =============================================
-// STEP 6: INFORMATION PANEL
-// =============================================
-
-var infoPanel = ui.Panel({
-  style: {
-    position: 'bottom-left',
-    padding: '10px',
-    backgroundColor: 'white',
-    border: '2px solid #43A047'
-  }
-});
-
-var infoTitle = ui.Label({
-  value: 'ℹ️ GEFERSA RESERVOIR MONITORING',
-  style: {
-    fontWeight: 'bold', 
-    fontSize: '14px', 
-    margin: '0 0 10px 0', 
-    color: '#43A047'
-  }
-});
-
-var infoContent = ui.Label({
-  value: 'HOW TO USE:\n' +
-         '1. Only "Reservoir Boundary" is visible by default\n' +
-         '2. Turn on layers in the Layers panel (top-left)\n' +
-         '3. Refer to legend on right for color meanings\n' +
-         '4. Check Console below for statistics\n\n' +
-         'LAYER DESCRIPTIONS:\n' +
-         '• TSS: Sediment and particles in water\n' +
-         '• Turbidity: Water clarity/cloudiness\n' +
-         '• DO Proxy: Oxygen levels for aquatic life\n' +
-         '• Chlorophyll: Algal concentration\n' +
-         '• WQI: Overall water quality score\n\n' +
-         'Data: Sentinel-2 (2023-2024)',
-  style: {fontSize: '11px', whiteSpace: 'pre'}
-});
-
-infoPanel.add(infoTitle);
-infoPanel.add(infoContent);
-Map.add(infoPanel);
-
-// =============================================
-// STEP 7: STATISTICAL ANALYSIS
-// =============================================
-
-var stats = ee.Image.cat([tss, turbidity, doProxy, chlorophyll, waterQualityIndex])
-  .reduceRegion({
-    reducer: ee.Reducer.mean(),
-    geometry: gefersaReservoir,
-    scale: 10,
-    maxPixels: 1e9
-  });
-
-stats.evaluate(function(result) {
-  print('=== 📊 GEFERSA RESERVOIR WATER QUALITY ===');
-  
-  if (result.TSS_mean) {
-    print('💧 TSS: ' + (result.TSS_mean * 8).toFixed(2) + ' mg/L proxy');
-    print('🌊 Turbidity: ' + (result.Turbidity_mean * 12).toFixed(2) + ' NTU proxy');
-    print('💨 DO Proxy: ' + (result.DO_Proxy_mean * 12).toFixed(2) + ' mg/L proxy');
-    print('🌿 Chlorophyll: ' + (result.Chlorophyll_mean * 60).toFixed(2) + ' μg/L proxy');
-    print('🎯 WQI: ' + result.WQI_mean.toFixed(3));
+    if (sel === L('💧 TSS - Total Suspended Solids')){
+      Map.addLayer(tss, {min:0, max:1, palette:palette('TSS')}, 'TSS');
+    } else if (sel === L('🌊 Turbidity - Water Clarity')){
+      Map.addLayer(turb, {min:0, max:1, palette:palette('Turbidity')}, 'Turbidity');
+    } else if (sel === L('💨 DO Proxy - Dissolved Oxygen')){
+      Map.addLayer(dop, {min:0, max:1, palette:palette('DO_Proxy')}, 'DO Proxy');
+    } else if (sel === L('🌿 Chlorophyll-a - Algal Concentration')){
+      Map.addLayer(chl, {min:0, max:1, palette:palette('Chlorophyll')}, 'Chlorophyll-a');
+    } else if (sel === L('📊 Water Quality Index - Overall')){
+      Map.addLayer(wqi, {min:0, max:1, palette:palette('WQI')}, 'WQI');
+    } else if (sel === L('🥧 WQI Classes - Categories')){
+      var tss = calcTSS(state.currentWaterComposite);
+      var turb = calcTurbidity(state.currentWaterComposite);
+      var dop  = calcDOProxy(state.currentWaterComposite);
+      var chl  = calcChl(state.currentWaterComposite);
+      var wqi  = calcWQI(tss, turb, dop, chl);
     
-    var quality = result.WQI_mean < 0.2 ? 'EXCELLENT' :
-                  result.WQI_mean < 0.4 ? 'GOOD' :
-                  result.WQI_mean < 0.6 ? 'FAIR' :
-                  result.WQI_mean < 0.8 ? 'POOR' : 'VERY POOR';
-    print('Overall Quality: ' + quality);
+      var classes = ee.Image(0).where(wqi.lt(0.2),1)
+        .where(wqi.gte(0.2).and(wqi.lt(0.4)),2)
+        .where(wqi.gte(0.4).and(wqi.lt(0.6)),3)
+        .where(wqi.gte(0.6).and(wqi.lt(0.8)),4)
+        .where(wqi.gte(0.8),5)
+        .rename('WQI_Class')
+        .updateMask(state.waterMask);
+    
+      Map.addLayer(classes, {min:1, max:5, palette:['#00441b','#238b45','#fed976','#f16913','#99000d']}, 'WQI Classes');
+    }
   }
-});
 
-// =============================================
-// STEP 8: EXPORT RESULTS
-// =============================================
+  updateLegendForLayer(sel);
+  statusLabel.setValue(L('✅ Layer loaded: ') + sel);
+}
 
-Export.image.toDrive({
-  image: waterQualityIndex.addBands(tss).addBands(turbidity).addBands(doProxy).addBands(chlorophyll),
-  description: 'Gefersa_Reservoir_Water_Quality',
-  scale: 10,
-  region: gefersaReservoir,
-  fileFormat: 'GeoTIFF'
-});
+// ----------------- CHARTS -----------------
+function clearCharts(){
+  chartPanel.clear();
+  chartPanel.add(ui.Label({value:L('📈 Charts'), style:{fontWeight:'bold', margin:'0 0 6px 0'}}));
+}
 
-print('=== ✅ ANALYSIS COMPLETE ===');
-print('Turn on layers in the Layers panel to see different water quality parameters!');
+function chartTimeSeries(){
+  clearCharts();
+  setChartDescription('time');
+  var dr = getDateRange();
+  var col = loadS2(dr[0], dr[1]);
+
+  var feats = col.map(function(img){
+    var wm = createWaterMask(img);
+    var wi = img.updateMask(wm);
+    var tss = calcTSS(wi), turb=calcTurbidity(wi), dop=calcDOProxy(wi), chl=calcChl(wi);
+    var wqi = calcWQI(tss,turb,dop,chl);
+    var mean = wqi.reduceRegion({reducer:ee.Reducer.mean(), geometry:gefersaReservoir, scale:30, maxPixels:1e9});
+    return ee.Feature(null, {
+      date: img.date().format('YYYY-MM-dd'),
+      WQI: mean.get('WQI')
+    });
+  }).filter(ee.Filter.notNull(['WQI']));
+
+  var chart = ui.Chart.feature.byFeature(feats, 'date', ['WQI'])
+    .setChartType('LineChart')
+    .setOptions({title:'WQI Time Series (per acquisition)', hAxis:{title:'Date', slantedText:true}, vAxis:{title:'WQI (0=best, 1=worst)'}, lineWidth:2});
+  chartPanel.add(chart);
+}
+
+function chartParameterComparison(){
+  clearCharts();
+  setChartDescription('compare');
+  var comp = state.currentWaterComposite;
+  var tss = calcTSS(comp), turb=calcTurbidity(comp), dop=calcDOProxy(comp), chl=calcChl(comp), wqi=calcWQI(tss,turb,dop,chl);
+  var means = ee.Image.cat([tss,turb,dop,chl,wqi]).reduceRegion({
+    reducer: ee.Reducer.mean(), geometry: gefersaReservoir, scale: 10, maxPixels: 1e9
+  });
+  var labels = ['TSS','Turbidity','DO_Proxy','Chlorophyll','WQI'];
+  var arr = ee.Array(labels.map(function(l){ return means.get(l); }));
+  var chart = ui.Chart.array.values({array: arr, axis:0, xLabels: labels})
+    .setChartType('ColumnChart')
+    .setOptions({title:'Current Water Quality Parameters (mean, masked to water)', hAxis:{title:'Parameter'}, vAxis:{title:'Normalized (0–1)'}});
+  chartPanel.add(chart);
+}
+
+function chartHistograms(){
+  clearCharts();
+  setChartDescription('hists');
+  var comp = state.currentWaterComposite;
+  var chl = calcChl(comp);
+  var wqi = calcWQI(calcTSS(comp), calcTurbidity(comp), calcDOProxy(comp), chl);
+
+  var h1 = ui.Chart.image.histogram({image:wqi, region:gefersaReservoir, scale:20, maxPixels:1e9})
+    .setOptions({title:'WQI Distribution'});
+  var h2 = ui.Chart.image.histogram({image:chl, region:gefersaReservoir, scale:20, maxPixels:1e9})
+    .setOptions({title:'Chlorophyll-a Distribution'});
+
+  chartPanel.add(h1);
+  chartPanel.add(h2);
+}
+
+function chartQualityDistribution(){
+  clearCharts();
+  setChartDescription('classes');
+
+  var comp = state.currentWaterComposite;
+  var wqi = calcWQI(calcTSS(comp), calcTurbidity(comp), calcDOProxy(comp), calcChl(comp));
+
+  var classes = ee.Image(0).where(wqi.lt(0.2),1)
+    .where(wqi.gte(0.2).and(wqi.lt(0.4)),2)
+    .where(wqi.gte(0.4).and(wqi.lt(0.6)),3)
+    .where(wqi.gte(0.6).and(wqi.lt(0.8)),4)
+    .where(wqi.gte(0.8),5)
+    .rename('WQI_Class')
+    .updateMask(state.waterMask);   // ✅ single-band mask
+
+    var hist = classes.reduceRegion({
+        reducer: ee.Reducer.frequencyHistogram(),
+        geometry: gefersaReservoir, scale: 20, maxPixels: 1e9
+      }).get('WQI_Class');
+    
+      // --- FIXED SECTION STARTS HERE ---
+      var dict = ee.Dictionary(hist);
+    
+      // Always look up integer-string keys ('1','2',...); default to 0 if missing.
+      var keys = ee.List.sequence(1, 5);
+      var vals = keys.map(function(k){
+        var keyStr = ee.Number(k).format('%.0f');           // '1','2','3','4','5'
+        var exists = dict.contains(keyStr);
+        var v = ee.Algorithms.If(exists, dict.get(keyStr), 0);
+        return ee.Number(v);
+      });
+    
+      var total = ee.Number(vals.reduce(ee.Reducer.sum()));
+    
+      // Avoid divide-by-zero: if total==0, keep zeros
+      var perc = vals.map(function(v){
+        return ee.Number(ee.Algorithms.If(
+          total.gt(0),
+          ee.Number(v).divide(total).multiply(100),
+          0
+        ));
+      });
+  var labels = ['Excellent','Good','Fair','Poor','Very Poor'];
+  var chart = ui.Chart.array.values({array: ee.Array(perc), axis:0, xLabels: labels})
+    .setChartType('PieChart')
+    .setOptions({title:'WQI Classes (% of masked pixels)'});
+
+  chartPanel.add(chart);
+}
+
+function chartSeasonalComparison(){
+  clearCharts();
+  setChartDescription('season');
+  var seasons = [
+    {name:'Dry Season 2024', start:'2024-01-01', end:'2024-04-30'},
+    {name:'Wet Season 2023', start:'2023-06-01', end:'2023-09-30'}
+  ];
+  var feats = ee.FeatureCollection(seasons.map(function(s){
+    var col = loadS2(s.start, s.end);
+    var comp = col.median().clip(gefersaReservoir);
+    var wm = createWaterMask(comp);
+    var wi = comp.updateMask(wm);
+    var wqi = calcWQI(calcTSS(wi), calcTurbidity(wi), calcDOProxy(wi), calcChl(wi));
+    var mean = wqi.reduceRegion({reducer:ee.Reducer.mean(), geometry:gefersaReservoir, scale:30, maxPixels:1e9});
+    return ee.Feature(null, {'Season': s.name, 'WQI': mean.get('WQI')});
+  }));
+  var chart = ui.Chart.feature.byFeature(feats, 'Season', ['WQI'])
+    .setChartType('ColumnChart')
+    .setOptions({title:'Seasonal Comparison – WQI', vAxis:{title:'WQI'}});
+  chartPanel.add(chart);
+}
+
+function displayChart(){
+  var sel = chartSelector.getValue();
+  statusLabel.setValue(L('📊 Generating chart...'));
+  if (sel === L('📈 Time Series Analysis')) chartTimeSeries();
+  else if (sel === L('📊 Parameter Comparison')) chartParameterComparison();
+  else if (sel === L('📈 Distribution Histograms')) chartHistograms();
+  else if (sel === L('🥧 Quality Class Distribution')) chartQualityDistribution();
+  else if (sel === L('🌦️ Seasonal Comparison')) chartSeasonalComparison();
+  statusLabel.setValue(L('✅ Chart displayed: ') + sel);
+}
+
+// --------------- EXPORT ----------------
+function doExport(){
+  var comp = state.currentWaterComposite;
+  var tss = calcTSS(comp), turb=calcTurbidity(comp), dop=calcDOProxy(comp), chl=calcChl(comp);
+  var wqi = calcWQI(tss,turb,dop,chl).rename('WQI');
+  var out = wqi.addBands([tss, turb, dop, chl]);
+  Export.image.toDrive({
+    image: out.toFloat(),
+    description: 'Gefersa_Water_Quality_App_Export',
+    scale: 10,
+    region: gefersaReservoir,
+    fileFormat: 'GeoTIFF',
+    crs: 'EPSG:32637',
+    maxPixels: 1e13
+  });
+  statusLabel.setValue(L('📤 Export task started – check Tasks tab'));
+}
+
+// --------------- EVENTS ----------------
+function refreshAll(){
+  updateMapLayer();
+  displayChart();
+}
+
+layerSelector.onChange(function(){ updateMapLayer(); });
+chartSelector.onChange(displayChart);
+periodSelector.onChange(refreshAll);
+dateSlider.onChange(refreshAll);
+refreshButton.onClick(refreshAll);
+exportButton.onClick(doExport);
+
+// ---------------- INIT ----------------
+updateMapLayer();
+displayChart();
